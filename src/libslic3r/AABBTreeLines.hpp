@@ -116,21 +116,19 @@ inline std::tuple<int, int> coordinate_aligned_ray_hit_count(size_t             
 }
 
 template<typename LineType, typename TreeType, typename VectorType>
-inline std::vector<std::pair<VectorType, size_t>> get_intersections_with_line(size_t                                node_idx,
-                                                                              const TreeType                       &tree,
-                                                                              const std::vector<LineType>          &lines,
-                                                                              const LineType                       &line,
-                                                                              const typename TreeType::BoundingBox &line_bb)
+inline void collect_intersections_with_line(size_t                                node_idx,
+                                            const TreeType                       &tree,
+                                            const std::vector<LineType>          &lines,
+                                            const LineType                       &line,
+                                            const typename TreeType::BoundingBox &line_bb,
+                                            std::vector<std::pair<VectorType, size_t>> &intersections)
 {
     const auto &node = tree.node(node_idx);
     assert(node.is_valid());
     if (node.is_leaf()) {
         VectorType intersection_pt;
-        if (line_alg::intersection(line, lines[node.idx], &intersection_pt)) {
-            return {std::pair<VectorType, size_t>(intersection_pt, node.idx)};
-        } else {
-            return {};
-        }
+        if (line_alg::intersection(line, lines[node.idx], &intersection_pt))
+            intersections.emplace_back(intersection_pt, node.idx);
     } else {
         size_t      left_node_idx  = node_idx * 2 + 1;
         size_t      right_node_idx = left_node_idx + 1;
@@ -139,21 +137,10 @@ inline std::vector<std::pair<VectorType, size_t>> get_intersections_with_line(si
         assert(node_left.is_valid());
         assert(node_right.is_valid());
 
-        std::vector<std::pair<VectorType, size_t>> result;
-
-        if (node_left.bbox.intersects(line_bb)) {
-            std::vector<std::pair<VectorType, size_t>> intersections =
-                get_intersections_with_line<LineType, TreeType, VectorType>(left_node_idx, tree, lines, line, line_bb);
-            result.insert(result.end(), intersections.begin(), intersections.end());
-        }
-
-        if (node_right.bbox.intersects(line_bb)) {
-            std::vector<std::pair<VectorType, size_t>> intersections =
-                get_intersections_with_line<LineType, TreeType, VectorType>(right_node_idx, tree, lines, line, line_bb);
-            result.insert(result.end(), intersections.begin(), intersections.end());
-        }
-
-        return result;
+        if (node_left.bbox.intersects(line_bb))
+            collect_intersections_with_line(left_node_idx, tree, lines, line, line_bb, intersections);
+        if (node_right.bbox.intersects(line_bb))
+            collect_intersections_with_line(right_node_idx, tree, lines, line, line_bb, intersections);
     }
 }
 
@@ -272,7 +259,8 @@ inline std::vector<std::pair<VectorType, size_t>> get_intersections_with_line(co
     auto line_bb = typename TreeType::BoundingBox(line.a, line.a);
     line_bb.extend(line.b);
 
-    auto intersections = detail::get_intersections_with_line<LineType, TreeType, VectorType>(0, tree, lines, line, line_bb);
+    std::vector<std::pair<VectorType, size_t>> intersections;
+    detail::collect_intersections_with_line(0, tree, lines, line, line_bb, intersections);
     if (sorted) {
         using Floating =
             typename std::conditional<std::is_floating_point<typename LineType::Scalar>::value, typename LineType::Scalar, double>::type;

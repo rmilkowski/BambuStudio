@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <Eigen/Geometry>
+#include <tbb/parallel_invoke.h>
 
 #include "BoundingBox.hpp"
 #include "Utils.hpp" // for next_highest_power_of_2()
@@ -145,8 +146,16 @@ private:
 		// Insert an inner node into the tree. Inner node does not reference any input entity (triangle, line segment etc).
 		m_nodes[node].idx  = inner;
 		m_nodes[node].bbox = bbox;
-        build_recursive(input, node * 2 + 1, left, center);
-		build_recursive(input, node * 2 + 2, center + 1, right);
+        // Both children write to disjoint input ranges and tree nodes.
+        constexpr size_t min_parallel_size = 16384;
+        if (right - left + 1 >= min_parallel_size)
+            tbb::parallel_invoke(
+                [&] { build_recursive(input, node * 2 + 1, left, center); },
+                [&] { build_recursive(input, node * 2 + 2, center + 1, right); });
+        else {
+            build_recursive(input, node * 2 + 1, left, center);
+            build_recursive(input, node * 2 + 2, center + 1, right);
+        }
 	}
 
 	// Partition the input m_nodes <left, right> at "k" and "dimension" using the QuickSelect method:
