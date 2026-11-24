@@ -12,6 +12,7 @@
 #include <string>
 #include <map>
 #include <cmath>
+#include <tbb/parallel_for.h>
 #include "libslic3r/Log.hpp"
 
 static const double max_deviation = scale_(0.5);
@@ -411,21 +412,21 @@ struct BridgeGroupArea {
     ExPolygons area;
 };
 
+static bool bridge_piece_overlaps(const ExPolygon &piece, const Polygons &area)
+{
+    if (area.empty())
+        return false;
+    const BoundingBox bounds = get_extents(piece.contour).inflated(SCALED_EPSILON);
+    const Polygons nearby_area = ClipperUtils::clip_clipper_polygons_with_subject_bbox(area, bounds);
+    return !nearby_area.empty() && !intersection_ex(piece, nearby_area).empty();
+}
+
 // Partition the anchors shared by bridge groups, which overlap but run in different directions.
 // Each contested point goes to the group with the nearest bridge body: all bodies grow in lock step,
 // so the dividing line is off by at most one step, ties within a step go to the lower group.
 // overlap_area: the whole overlap group closed at once, as it was merged before splitting by direction.
-static void partition_bridge_anchors(std::vector<BridgeGroupArea*> &groups, const ExPolygons &overlap_area, const float solid_spacing)
+static void partition_bridge_anchors(const std::vector<BridgeGroupArea*> &groups, const ExPolygons &overlap_area, const float solid_spacing)
 {
-    // A bridge body always belongs to its own group.
-    for (BridgeGroupArea *group : groups) {
-        Polygons other_bodies;
-        for (const BridgeGroupArea *other : groups)
-            if (other != group)
-                append(other_bodies, to_polygons(other->bodies));
-        group->area = diff_ex(group->area, other_bodies);
-    }
-
     // Closing each group alone leaves the narrow gaps between the groups open, closing the whole overlap group fills them.
     // Offer the gaps to every group, the growth below hands them to the nearest body.
     {
@@ -434,11 +435,12 @@ static void partition_bridge_anchors(std::vector<BridgeGroupArea*> &groups, cons
             append(covered, to_polygons(group->area));
         const Polygons gaps = diff(to_polygons(overlap_area), covered);
         if (! gaps.empty())
-            for (BridgeGroupArea *group : groups) {
+            tbb::parallel_for(size_t(0), groups.size(), [&](size_t i) {
+                BridgeGroupArea *group = groups[i];
                 Polygons area = to_polygons(group->area);
                 append(area, gaps);
                 group->area = union_ex(area);
-            }
+            });
     }
 
     Polygons contested;
@@ -476,11 +478,12 @@ static void partition_bridge_anchors(std::vector<BridgeGroupArea*> &groups, cons
     std::vector<Polygons> bodies(groups.size());
     const BoundingBox     contested_bbox = get_extents(contested);
     BoundingBox           bbox           = contested_bbox;
-    for (size_t i = 0; i < groups.size(); ++ i) {
+    tbb::parallel_for(size_t(0), groups.size(), [&](size_t i) {
         candidates[i] = drop_noise(intersection_ex(to_polygons(groups[i]->area), contested));
         bodies[i]     = to_polygons(groups[i]->bodies);
-        bbox.merge(get_extents(bodies[i]));
-    }
+    });
+    for (const Polygons &body : bodies)
+        bbox.merge(get_extents(body));
 
     // Each contested point is reached at the latest when the growth spans the whole extent,
     // in practice once the farthest anchor point is covered.
@@ -492,35 +495,69 @@ static void partition_bridge_anchors(std::vector<BridgeGroupArea*> &groups, cons
     // A point is claimed by the group reaching it first, ties within a step go to the lower group:
     // the claim of group i is its reach minus the reach of all groups in the previous step
     // and minus the reach of the lower groups in this step.
-    Polygons reached_before;
-    for (size_t istep = 1; istep <= max_steps; ++ istep) {
+    struct GrowthStep {
+        std::vector<Polygons> reaches;
+        Polygons coverage;
+        bool complete = false;
+    };
+    auto grow = [&](size_t istep, size_t i) -> Polygons {
+        if (candidates[i].empty())
+            return {};
         const float dist = step * istep;
         // Body parts farther than dist from the contested area cannot reach anything in this step,
         // an exact clip keeps the offset small without changing the distances that matter.
         const Polygons clip_box{ contested_bbox.inflated(dist + step).polygon() };
-        // Reached before this step or by a lower group in this step.
-        Polygons taken = reached_before;
-        // Reached by any group up to this step.
+        Polygons body = intersection(bodies[i], clip_box);
+        return body.empty() ? Polygons{} : intersection(candidates[i], expand(body, dist, ClipperLib::jtRound, arc_tol));
+    };
+    const auto finish_growth = [&](GrowthStep &growth) {
         Polygons reached_now;
-        for (size_t i = 0; i < groups.size(); ++ i) {
-            if (candidates[i].empty())
-                continue;
-            Polygons body = intersection(bodies[i], clip_box);
-            if (body.empty())
-                continue;
-            Polygons reach = intersection(candidates[i], expand(body, dist, ClipperLib::jtRound, arc_tol));
-            if (reach.empty())
-                continue;
-            append(claimed[i], taken.empty() ? reach : diff(reach, taken));
-            append(taken, reach);
-            append(reached_now, std::move(reach));
-        }
+        for (const auto &reach : growth.reaches)
+            append(reached_now, reach);
         // The reach of a group only grows from step to step, so this step alone covers all the earlier ones.
-        reached_before = union_(reached_now);
-        if (drop_noise(diff_ex(contested, reached_before)).empty()) {
-            all_reached = true;
+        growth.coverage = union_(reached_now);
+        const ExPolygons unreached = diff_ex(contested, growth.coverage);
+        growth.complete = std::all_of(unreached.begin(), unreached.end(),
+            [min_area](const ExPolygon &piece) { return piece.area() < min_area; });
+    };
+
+    Polygons reached_before;
+    constexpr size_t max_batch_size = 8;
+    for (size_t first_step = 1; first_step <= max_steps;) {
+        // Quickly finish small partitions and bound the unused work after the first complete step.
+        const size_t batch_size = std::min({first_step, max_batch_size, max_steps - first_step + 1});
+        std::vector<GrowthStep> batch(batch_size);
+        for (GrowthStep &growth : batch)
+            growth.reaches.resize(groups.size());
+        tbb::parallel_for(size_t(0), batch_size * groups.size(), [&](size_t job) {
+            const size_t step_index = job / groups.size();
+            const size_t group_index = job % groups.size();
+            batch[step_index].reaches[group_index] = grow(first_step + step_index, group_index);
+        });
+        tbb::parallel_for(size_t(0), batch_size, [&](size_t i) { finish_growth(batch[i]); });
+        const auto complete = std::find_if(batch.begin(), batch.end(),
+            [](const GrowthStep &growth) { return growth.complete; });
+        all_reached = complete != batch.end();
+        const size_t used_steps = all_reached ? size_t(complete - batch.begin() + 1) : batch_size;
+        tbb::parallel_for(size_t(0), used_steps, [&](size_t i) {
+            // Reached before this step or by a lower group in this step.
+            Polygons taken = i == 0 ? reached_before : batch[i - 1].coverage;
+            for (Polygons &reach : batch[i].reaches) {
+                if (reach.empty())
+                    continue;
+                Polygons newly_claimed = taken.empty() ? reach : diff(reach, taken);
+                append(taken, std::move(reach));
+                reach = std::move(newly_claimed);
+            }
+        });
+        // Keep claims in the original step and group order.
+        for (size_t i = 0; i < used_steps; ++i)
+            for (size_t j = 0; j < groups.size(); ++j)
+                append(claimed[j], std::move(batch[i].reaches[j]));
+        if (all_reached)
             break;
-        }
+        reached_before = std::move(batch.back().coverage);
+        first_step += batch_size;
     }
     if (! all_reached)
         BOOST_LOG_TRIVIAL(warning) << "Bridge anchor partition left an unreached area, the lower group takes it";
@@ -533,32 +570,31 @@ static void partition_bridge_anchors(std::vector<BridgeGroupArea*> &groups, cons
         append(claimed.front(), diff(contested, all_claimed));
     }
 
-    for (size_t i = 0; i < groups.size(); ++ i) {
+    tbb::parallel_for(size_t(0), groups.size(), [&](size_t i) {
         Polygons area = diff(to_polygons(groups[i]->area), contested);
         append(area, std::move(claimed[i]));
         groups[i]->area = union_ex(area);
-    }
+    });
 
     // Pieces cut off from their own body follow a touching group instead of becoming a separate bridge.
     const float touch = scaled<float>(0.01);
     std::vector<ExPolygons> orphans(groups.size());
-    for (size_t i = 0; i < groups.size(); ++ i) {
-        const Polygons body_touch = expand(to_polygons(groups[i]->bodies), touch);
-        ExPolygons     kept;
+    std::vector<Polygons> area_touch(groups.size());
+    tbb::parallel_for(size_t(0), groups.size(), [&](size_t i) {
+        const Polygons body_touch = expand(bodies[i], touch);
+        ExPolygons kept;
         for (ExPolygon &piece : groups[i]->area)
-            (intersection_ex(piece, body_touch).empty() ? orphans[i] : kept).emplace_back(std::move(piece));
+            (bridge_piece_overlaps(piece, body_touch) ? kept : orphans[i]).emplace_back(std::move(piece));
         groups[i]->area = std::move(kept);
-    }
+        area_touch[i] = expand(to_polygons(groups[i]->area), touch);
+    });
     // Touch areas are taken before any orphan moves, so the result does not depend on the visiting order.
     // An orphan touching no other group stays where it is.
-    std::vector<Polygons> area_touch(groups.size());
-    for (size_t i = 0; i < groups.size(); ++ i)
-        area_touch[i] = expand(to_polygons(groups[i]->area), touch);
     for (size_t i = 0; i < groups.size(); ++ i)
         for (ExPolygon &orphan : orphans[i]) {
             size_t owner = i;
             for (size_t j = 0; j < groups.size(); ++ j)
-                if (j != i && ! intersection_ex(orphan, area_touch[j]).empty()) {
+                if (j != i && bridge_piece_overlaps(orphan, area_touch[j])) {
                     owner = j;
                     break;
                 }
@@ -583,8 +619,14 @@ Surfaces merge_bridges(
     }
 
     std::vector<BridgeGroupArea> groups;
-    // Unclosed area of each overlap group split by direction.
-    std::map<uint32_t, Polygons> overlap_areas;
+    std::vector<Polygons> unclosed_groups;
+    struct OverlapArea {
+        Polygons unclosed;
+        ExPolygons closed;
+        std::vector<BridgeGroupArea *> members;
+    };
+    // Only overlaps split by bridge direction need to be partitioned.
+    std::map<uint32_t, OverlapArea> overlap_areas;
     for (uint32_t bridge_id = 0; bridge_id < uint32_t(bridges.size()); ++ bridge_id) {
         if (group_id(bridges, bridge_id) == bridge_id) {
             // Head of the group.
@@ -611,20 +653,44 @@ Surfaces merge_bridges(
             // without safety offset, artifacts are generated (GH #2494)
             // union_safety_offset_ex(acc)
             if (split)
-                append(overlap_areas[overlap_group_id], acc);
+                append(overlap_areas[overlap_group_id].unclosed, acc);
             groups.push_back({ overlap_group_id, bridges[bridge_id].angle ? *bridges[bridge_id].angle : -1,
-                               std::move(bodies), closing_ex(acc, closing_radius) });
+                               std::move(bodies), {} });
+            unclosed_groups.emplace_back(std::move(acc));
         }
     }
 
-    std::map<uint32_t, std::vector<BridgeGroupArea*>> overlapping;
+    std::vector<OverlapArea *> overlaps;
+    overlaps.reserve(overlap_areas.size());
+    for (auto &entry : overlap_areas)
+        overlaps.emplace_back(&entry.second);
     for (BridgeGroupArea &group : groups)
         if (split_overlap_groups[group.overlap_group_id])
-            overlapping[group.overlap_group_id].push_back(&group);
-    for (auto &[overlap_group_id, members] : overlapping) {
-        assert(members.size() > 1);
-        partition_bridge_anchors(members, closing_ex(overlap_areas[overlap_group_id], closing_radius), solid_spacing);
-    }
+            overlap_areas.at(group.overlap_group_id).members.push_back(&group);
+
+    tbb::parallel_for(size_t(0), groups.size() + overlaps.size(), [&](size_t i) {
+        if (i < groups.size()) {
+            BridgeGroupArea &group = groups[i];
+            group.area = closing_ex(unclosed_groups[i], closing_radius);
+            if (split_overlap_groups[group.overlap_group_id]) {
+                // A bridge body always belongs to its own group. Trim the
+                // other bodies while the combined overlap is being closed.
+                Polygons other_bodies;
+                for (const BridgeGroupArea *other : overlap_areas.at(group.overlap_group_id).members)
+                    if (other != &group)
+                        append(other_bodies, to_polygons(other->bodies));
+                group.area = diff_ex(group.area, other_bodies);
+            }
+        } else {
+            OverlapArea &overlap = *overlaps[i - groups.size()];
+            overlap.closed = closing_ex(overlap.unclosed, closing_radius);
+        }
+    });
+    tbb::parallel_for(size_t(0), overlaps.size(), [&](size_t i) {
+        const OverlapArea &overlap = *overlaps[i];
+        assert(overlap.members.size() > 1);
+        partition_bridge_anchors(overlap.members, overlap.closed, solid_spacing);
+    });
 
     Surfaces result;
     for (BridgeGroupArea &group : groups) {
