@@ -47,6 +47,7 @@
 #include <cstdlib>
 #include <ostream>
 #include <functional>
+#include <limits>
 #include <assert.h>
 #include <libslic3r/Int128.hpp>
 
@@ -359,7 +360,7 @@ inline cInt TopX(TEdge &edge, const cInt currentY)
 }
 //------------------------------------------------------------------------------
 
-void IntersectPoint(TEdge &Edge1, TEdge &Edge2, IntPoint &ip)
+static void IntersectPoint(TEdge &Edge1, TEdge &Edge2, cInt botY, IntPoint &ip)
 {
 #ifdef CLIPPERLIB_USE_XYZ  
   ip.z() = 0;
@@ -368,7 +369,7 @@ void IntersectPoint(TEdge &Edge1, TEdge &Edge2, IntPoint &ip)
   double b1, b2;
   if (Edge1.Dx == Edge2.Dx)
   {
-    ip.y() = Edge1.Curr.y();
+    ip.y() = botY;
     ip.x() = TopX(Edge1, ip.y());
     return;
   }
@@ -417,9 +418,9 @@ void IntersectPoint(TEdge &Edge1, TEdge &Edge2, IntPoint &ip)
       ip.x() = TopX(Edge2, ip.y());
   } 
   //finally, don't allow 'ip' to be BELOW curr.y() (ie bottom of scanbeam) ...
-  if (ip.y() > Edge1.Curr.y())
+  if (ip.y() > botY)
   {
-    ip.y() = Edge1.Curr.y();
+    ip.y() = botY;
     //use the more vertical edge to derive X ...
     if (std::fabs(Edge1.Dx) > std::fabs(Edge2.Dx))
       ip.x() = TopX(Edge2, ip.y()); else
@@ -1071,8 +1072,6 @@ void Clipper::Reset()
   m_Maxima.clear();
   m_ActiveEdges = 0;
   m_SortedEdges = 0;
-  for (auto lm = m_MinimaList.rbegin(); lm != m_MinimaList.rend(); ++lm)
-    m_Scanbeam.push(lm->Y);
 }
 
 //------------------------------------------------------------------------------
@@ -1118,15 +1117,23 @@ bool Clipper::ExecuteInternal()
    CLIPPERLIB_PROFILE_BLOCK(Clipper_ExecuteInternal_Process);
     Reset();
     if (m_MinimaList.empty()) return true;
-    cInt botY = m_Scanbeam.top();
-    do { m_Scanbeam.pop(); } while (! m_Scanbeam.empty() && botY == m_Scanbeam.top());
+    // The local minima are already sorted. Keep only active-edge tops in
+    // the heap and merge the two streams as the scanline advances.
+    const auto next_scanbeam = [&]() {
+      const cInt y = m_Scanbeam.empty() ? m_MinimaList.back().Y :
+                     m_MinimaList.empty() ? m_Scanbeam.top() :
+                     std::max(m_Scanbeam.top(), m_MinimaList.back().Y);
+      while (!m_Scanbeam.empty() && m_Scanbeam.top() == y)
+        m_Scanbeam.pop();
+      return y;
+    };
+    cInt botY = next_scanbeam();
     do {
       InsertLocalMinimaIntoAEL(botY);
       ProcessHorizontals();
-	    m_GhostJoins.clear();
-	    if (m_Scanbeam.empty()) break;
-      cInt topY = m_Scanbeam.top();
-      do { m_Scanbeam.pop(); } while (! m_Scanbeam.empty() && topY == m_Scanbeam.top());
+      m_GhostJoins.clear();
+      if (m_Scanbeam.empty() && m_MinimaList.empty()) break;
+      const cInt topY = next_scanbeam();
       succeeded = ProcessIntersections(topY);
       if (!succeeded) break;
       ProcessEdgesAtTopOfScanbeam(topY);
@@ -2453,17 +2460,36 @@ void Clipper::BuildIntersectList(const cInt topY)
 {
   if ( !m_ActiveEdges ) return;
 
-  // Project the active edges to the top of the scanbeam. They only need a
-  // sorted-edge list when two projections are out of order.
-  TEdge* e = m_ActiveEdges;
-  cInt previous_x = e->Curr.x() = TopX(*e, topY);
+  // With no edge crossings or strict-simple joins, only edges ending
+  // on this scanline need another visit after projecting the active list.
+  const cInt botY = m_ActiveEdges->Curr.y();
+  TEdge* first = nullptr;
+  TEdge** tail = &first;
+  cInt previous_x = std::numeric_limits<cInt>::lowest();
   bool have_intersections = false;
-  for (e = e->NextInAEL; e; e = e->NextInAEL) {
+  TEdge* e = m_ActiveEdges;
+  for (; e; e = e->NextInAEL) {
+    assert(e->Curr.y() == botY);
     const cInt x = e->Curr.x() = TopX(*e, topY);
     have_intersections |= previous_x > x;
     previous_x = x;
+    if (!m_StrictSimple) {
+      e->Curr.y() = topY;
+      if (e->Top.y() == topY) {
+        *tail = e;
+        tail = &e->NextInSEL;
+      }
+    }
   }
-  if (!have_intersections) return;
+  if (!have_intersections) {
+    if (!m_StrictSimple) {
+      *tail = nullptr;
+      // The SEL is empty here. Pass the terminating edges to
+      // ProcessEdgesAtTopOfScanbeam, which clears it before adding horizontals.
+      m_SortedEdges = first;
+    }
+    return;
+  }
   CopyAELToSEL();
 
   //bubblesort ...
@@ -2478,7 +2504,7 @@ void Clipper::BuildIntersectList(const cInt topY)
       IntPoint Pt;
       if(e->Curr.x() > eNext->Curr.x())
       {
-        IntersectPoint(*e, *eNext, Pt);
+        IntersectPoint(*e, *eNext, botY, Pt);
         m_IntersectList.emplace_back(IntersectNode(e, eNext, Pt));
         SwapPositionsInSEL(e, eNext);
         isModified = true;
@@ -2581,10 +2607,21 @@ void Clipper::DoMaxima(TEdge *e)
 void Clipper::ProcessEdgesAtTopOfScanbeam(const cInt topY)
 {
   CLIPPERLIB_PROFILE_FUNC();
-  bool have_intermediate_edges = false;
-  TEdge* e = m_ActiveEdges;
+  // Use the inactive SEL links of non-horizontal edges to remember which
+  // vertices to promote after the horizontal pass, in active-edge order.
+  TEdge* intermediate_edges = nullptr;
+  TEdge** intermediate_tail = &intermediate_edges;
+  const bool have_top_edges = m_SortedEdges != nullptr;
+  TEdge* e = have_top_edges ? m_SortedEdges : m_ActiveEdges;
+  m_SortedEdges = nullptr;
   while( e )
   {
+    TEdge* next_top = have_top_edges ? e->NextInSEL : nullptr;
+    if (have_top_edges && !e->PrevInAEL && !e->NextInAEL && e != m_ActiveEdges) {
+      // Another maximum already removed this edge.
+      e = next_top;
+      continue;
+    }
     //1. process maxima, treating them as if they're 'bent' horizontal edges,
     //   but exclude maxima with horizontal edges. nb: e can't be a horizontal.
     bool IsMaximaEdge = IsMaxima(e, topY);
@@ -2600,7 +2637,8 @@ void Clipper::ProcessEdgesAtTopOfScanbeam(const cInt topY)
       if (m_StrictSimple) m_Maxima.push_back(e->Top.x());
       TEdge* ePrev = e->PrevInAEL;
       DoMaxima(e);
-      if( !ePrev ) e = m_ActiveEdges;
+      if (have_top_edges) e = next_top;
+      else if (!ePrev) e = m_ActiveEdges;
       else e = ePrev->NextInAEL;
     }
     else
@@ -2618,7 +2656,11 @@ void Clipper::ProcessEdgesAtTopOfScanbeam(const cInt topY)
       {
         assert(e->Curr.x() == TopX(*e, topY));
         e->Curr.y() = topY;
-        have_intermediate_edges |= is_intermediate;
+        if (is_intermediate)
+        {
+          *intermediate_tail = e;
+          intermediate_tail = &e->NextInSEL;
+        }
       }
 
       //When StrictlySimple and 'e' is being touched by another edge, then
@@ -2639,49 +2681,48 @@ void Clipper::ProcessEdgesAtTopOfScanbeam(const cInt topY)
         }
       }
 
-      e = e->NextInAEL;
+      e = have_top_edges ? next_top : e->NextInAEL;
     }
   }
+
+  *intermediate_tail = nullptr;
 
   //3. Process horizontals at the Top of the scanbeam ...
   std::sort(m_Maxima.begin(), m_Maxima.end());
   ProcessHorizontals();
   m_Maxima.clear();
 
-  //4. Promote the remaining intermediate vertices after the horizontal pass.
-  e = have_intermediate_edges ? m_ActiveEdges : nullptr;
-  while(e)
+  //4. Horizontals can cross other edges but do not reorder the remaining
+  // intermediate edges relative to one another.
+  for (TEdge* intermediate = intermediate_edges; intermediate; intermediate = intermediate->NextInSEL)
   {
-    if(IsIntermediate(e, topY))
-    {
-      OutPt* op = 0;
-      if( e->OutIdx >= 0 ) 
-        op = AddOutPt(e, e->Top);
-      UpdateEdgeIntoAEL(e);
+    e = intermediate;
+    OutPt* op = 0;
+    if (e->OutIdx >= 0)
+      op = AddOutPt(e, e->Top);
+    UpdateEdgeIntoAEL(e);
 
-      //if output polygons share an edge, they'll need joining later ...
-      TEdge* ePrev = e->PrevInAEL;
-      TEdge* eNext = e->NextInAEL;
-      if (ePrev && ePrev->Curr.x() == e->Bot.x() &&
-        ePrev->Curr.y() == e->Bot.y() && op &&
-        ePrev->OutIdx >= 0 && ePrev->Curr.y() > ePrev->Top.y() &&
-        SlopesEqual(*e, *ePrev, m_UseFullRange) &&
-        (e->WindDelta != 0) && (ePrev->WindDelta != 0))
-      {
-        OutPt* op2 = AddOutPt(ePrev, e->Bot);
-        m_Joins.emplace_back(Join(op, op2, e->Top));
-      }
-      else if (eNext && eNext->Curr.x() == e->Bot.x() &&
-        eNext->Curr.y() == e->Bot.y() && op &&
-        eNext->OutIdx >= 0 && eNext->Curr.y() > eNext->Top.y() &&
-        SlopesEqual(*e, *eNext, m_UseFullRange) &&
-        (e->WindDelta != 0) && (eNext->WindDelta != 0))
-      {
-        OutPt* op2 = AddOutPt(eNext, e->Bot);
-        m_Joins.emplace_back(Join(op, op2, e->Top));
-      }
+    //if output polygons share an edge, they'll need joining later ...
+    TEdge* ePrev = e->PrevInAEL;
+    TEdge* eNext = e->NextInAEL;
+    if (ePrev && ePrev->Curr.x() == e->Bot.x() &&
+      ePrev->Curr.y() == e->Bot.y() && op &&
+      ePrev->OutIdx >= 0 && ePrev->Curr.y() > ePrev->Top.y() &&
+      SlopesEqual(*e, *ePrev, m_UseFullRange) &&
+      (e->WindDelta != 0) && (ePrev->WindDelta != 0))
+    {
+      OutPt* op2 = AddOutPt(ePrev, e->Bot);
+      m_Joins.emplace_back(Join(op, op2, e->Top));
     }
-    e = e->NextInAEL;
+    else if (eNext && eNext->Curr.x() == e->Bot.x() &&
+      eNext->Curr.y() == e->Bot.y() && op &&
+      eNext->OutIdx >= 0 && eNext->Curr.y() > eNext->Top.y() &&
+      SlopesEqual(*e, *eNext, m_UseFullRange) &&
+      (e->WindDelta != 0) && (eNext->WindDelta != 0))
+    {
+      OutPt* op2 = AddOutPt(eNext, e->Bot);
+      m_Joins.emplace_back(Join(op, op2, e->Top));
+    }
   }
 }
 //------------------------------------------------------------------------------
