@@ -153,9 +153,14 @@ std::vector<float> raycast_visibility(const AABBTreeIndirect::Tree<3, float> &ra
 
     bool model_contains_negative_parts = negative_volumes_start_index < triangles.indices.size();
 
+    // Many rays can hit the same face; its normal is independent of the ray.
+    std::vector<Vec3f> face_normals(triangles.indices.size());
+    for (size_t i = 0; i < face_normals.size(); ++i)
+        face_normals[i] = its_face_normal(triangles, triangles.indices[i]);
+
     std::vector<float> result(samples.positions.size());
     tbb::parallel_for(tbb::blocked_range<size_t>(0, result.size()), [&triangles, &precomputed_sample_directions, model_contains_negative_parts, negative_volumes_start_index,
-                                                                     &raycasting_tree, &result, &samples](tbb::blocked_range<size_t> r) {
+                                                                     &raycasting_tree, &result, &samples, &face_normals](tbb::blocked_range<size_t> r) {
         // Maintaining hits memory outside of the loop, so it does not have to be reallocated for each query.
         std::vector<igl::Hit> hits;
         for (size_t s_idx = r.begin(); s_idx < r.end(); ++s_idx) {
@@ -164,6 +169,11 @@ std::vector<float> raycast_visibility(const AABBTreeIndirect::Tree<3, float> &ra
 
             const Vec3f &center = samples.positions[s_idx];
             const Vec3f &normal = samples.normals[s_idx];
+            const bool casting_from_negative_volume = model_contains_negative_parts &&
+                samples.triangle_indices[s_idx] >= negative_volumes_start_index;
+            const Vec3d ray_origin = casting_from_negative_volume ?
+                (center - normal * 0.01f).cast<double>().eval() :
+                (center + normal * 0.01f).cast<double>().eval();
             // apply the local direction via Frame struct - the local_dir is with respect to +Z being forward
             Frame f;
             f.set_from_z(normal);
@@ -175,25 +185,19 @@ std::vector<float> raycast_visibility(const AABBTreeIndirect::Tree<3, float> &ra
                     // FIXME: This AABBTTreeIndirect query will not compile for float ray origin and
                     // direction.
                     Vec3d final_ray_dir_d = final_ray_dir.cast<double>();
-                    Vec3d ray_origin_d    = (center + normal * 0.01f).cast<double>(); // start above surface.
-                    bool  hit = AABBTreeIndirect::intersect_ray_first_hit(triangles.vertices, triangles.indices, raycasting_tree, ray_origin_d, final_ray_dir_d, hitpoint);
-                    if (hit && its_face_normal(triangles, hitpoint.id).dot(final_ray_dir) <= 0) { result[s_idx] -= decrease_step; }
+                    bool  hit = AABBTreeIndirect::intersect_ray_first_hit(triangles.vertices, triangles.indices, raycasting_tree, ray_origin, final_ray_dir_d, hitpoint);
+                    if (hit && face_normals[hitpoint.id].dot(final_ray_dir) <= 0) { result[s_idx] -= decrease_step; }
                 } else { // TODO improve logic for order based boolean operations - consider order of volumes
-                    bool casting_from_negative_volume = samples.triangle_indices[s_idx] >= negative_volumes_start_index;
-
-                    Vec3d ray_origin_d = (center + normal * 0.01f).cast<double>(); // start above surface.
-                    if (casting_from_negative_volume) {                            // if casting from negative volume face, invert direction, change start pos
+                    if (casting_from_negative_volume)
                         final_ray_dir = -1.0 * final_ray_dir;
-                        ray_origin_d  = (center - normal * 0.01f).cast<double>();
-                    }
                     Vec3d final_ray_dir_d = final_ray_dir.cast<double>();
-                    bool  some_hit        = AABBTreeIndirect::intersect_ray_all_hits(triangles.vertices, triangles.indices, raycasting_tree, ray_origin_d, final_ray_dir_d, hits);
+                    bool  some_hit        = AABBTreeIndirect::intersect_ray_all_hits(triangles.vertices, triangles.indices, raycasting_tree, ray_origin, final_ray_dir_d, hits);
                     if (some_hit) {
                         int counter = 0;
                         // NOTE: iterating in reverse, from the last hit for one simple reason: We know the state of the ray at that point;
                         //  It cannot be inside model, and it cannot be inside negative volume
                         for (int hit_index = int(hits.size()) - 1; hit_index >= 0; --hit_index) {
-                            Vec3f face_normal = its_face_normal(triangles, hits[hit_index].id);
+                            const Vec3f &face_normal = face_normals[hits[hit_index].id];
                             if (hits[hit_index].id >= int(negative_volumes_start_index)) { // negative volume hit
                                 counter -= sgn(face_normal.dot(final_ray_dir));            // if volume face aligns with ray dir, we are leaving negative space
                                 // which in reverse hit analysis means, that we are entering negative space :) and vice versa
@@ -300,29 +304,20 @@ struct GlobalModelInfo
 
     float calculate_point_visibility(const Vec3f &position) const
     {
-        std::vector<size_t> points = find_nearby_points(mesh_samples_tree, position, mesh_samples_radius);
-        if (points.empty()) { return 1.0f; }
-
-        auto compute_dist_to_plane = [](const Vec3f &position, const Vec3f &plane_origin, const Vec3f &plane_normal) {
-            Vec3f orig_to_point = position - plane_origin;
-            return std::abs(orig_to_point.dot(plane_normal));
-        };
-
         float total_weight     = 0;
         float total_visibility = 0;
-        for (size_t i = 0; i < points.size(); ++i) {
-            size_t sample_idx = points[i];
+        bool found_sample      = false;
+        visit_nearby_points(mesh_samples_tree, position, mesh_samples_radius, [](size_t) { return true; }, [&](size_t sample_idx) {
+            found_sample = true;
+            const Vec3f offset = position - this->mesh_samples.positions[sample_idx];
+            const Vec3f &sample_normal = this->mesh_samples.normals[sample_idx];
 
-            Vec3f sample_point  = this->mesh_samples.positions[sample_idx];
-            Vec3f sample_normal = this->mesh_samples.normals[sample_idx];
-
-            float weight = mesh_samples_radius - compute_dist_to_plane(position, sample_point, sample_normal);
-            weight += (mesh_samples_radius - (position - sample_point).norm());
+            float weight = mesh_samples_radius - std::abs(offset.dot(sample_normal));
+            weight += mesh_samples_radius - offset.norm();
             total_visibility += weight * mesh_samples_visibility[sample_idx];
             total_weight += weight;
-        }
-
-        return total_visibility / total_weight;
+        });
+        return found_sample ? total_visibility / total_weight : 1.0f;
     }
 
 #ifdef DEBUG_FILES
