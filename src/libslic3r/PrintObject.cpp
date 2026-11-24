@@ -2792,7 +2792,13 @@ void PrintObject::bridge_over_infill()
                     if (layer->lower_layer == nullptr) {
                         continue;
                     }
-                    double spacing = layer->regions().front()->flow(frSolidInfill).scaled_spacing();
+                    const auto &regions = layer->regions();
+                    // Only internal solid surfaces can produce bridge candidates.
+                    if (std::none_of(regions.begin(), regions.end(), [](const LayerRegion *region) {
+                            return region->fill_surfaces.has(stInternalSolid);
+                        }))
+                        continue;
+                    double spacing = regions.front()->flow(frSolidInfill).scaled_spacing();
                     // unsupported area will serve as a filter for polygons worth bridging.
                     Polygons   unsupported_area; // 下一层不提供支撑的区域
                     Polygons   lower_layer_solids;  // 下一层的实心区域，可以提供支撑
@@ -2817,7 +2823,7 @@ void PrintObject::bridge_over_infill()
                     unsupported_area   = shrink(unsupported_area, 3 * spacing);
                     unsupported_area   = diff(unsupported_area, lower_layer_solids);
 
-                    for (LayerRegion *region : layer->regions()) {
+                    for (LayerRegion *region : regions) {
                         auto region_internal_solids =  region->fill_surfaces.filter_by_type(stInternalSolid); // 取当前层的实心区域
                         for (const Surface *s : region_internal_solids) {
                             Polygons unsupported         = intersection(to_polygons(s->expolygon), unsupported_area); // 当前层需要生成桥接的区域，通过当前层的实心区域与下一层的非实心区域求交得到
@@ -3553,9 +3559,13 @@ void PrintObject::bridge_over_infill()
             for (LayerRegion *region : layer->regions()) {
                 Surfaces new_surfaces;
 
-                Polygons near_perimeters = to_polygons(union_safety_offset_ex(to_polygons(region->fill_surfaces.surfaces))); // 填充区域中，紧靠着外墙的区域
-                near_perimeters          = diff(near_perimeters, shrink(near_perimeters, region->flow(frSolidInfill).scaled_spacing()));
-                ExPolygons additional_ensuring = intersection_ex(additional_ensuring_areas, near_perimeters); // 紧靠着外墙，能够给上一层的桥接提供支撑的区域
+                Polygons near_perimeters;
+                ExPolygons additional_ensuring;
+                if (!additional_ensuring_areas.empty()) {
+                    near_perimeters = to_polygons(union_safety_offset_ex(to_polygons(region->fill_surfaces.surfaces))); // 填充区域中，紧靠着外墙的区域
+                    near_perimeters = diff(near_perimeters, shrink(near_perimeters, region->flow(frSolidInfill).scaled_spacing()));
+                    additional_ensuring = intersection_ex(additional_ensuring_areas, near_perimeters); // 紧靠着外墙，能够给上一层的桥接提供支撑的区域
+                }
 
                 SurfacesPtr internal_infills = region->fill_surfaces.filter_by_type(stInternal);
                 ExPolygons new_internal_infills = diff_ex(internal_infills, cut_from_infill); // 新的稀疏填充区域，去掉生成的桥接区域
