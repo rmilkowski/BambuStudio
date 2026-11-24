@@ -1,3 +1,4 @@
+#include <tbb/parallel_for.h>
 #include "ClipperUtils.hpp"
 #include "Geometry.hpp"
 #include "ShortestPath.hpp"
@@ -272,30 +273,64 @@ bool has_duplicate_points(const ClipperLib::PolyTree &polytree)
 template<typename PathsProvider>
 static ClipperLib::Paths raw_offset(PathsProvider &&paths, float offset, ClipperLib::JoinType joinType, double miterLimit, ClipperLib::EndType endType = ClipperLib::etClosedPolygon)
 {
-    ClipperLib::ClipperOffset co;
+    const auto offset_paths = [&](const auto &range, ClipperLib::Paths &out) {
+        ClipperLib::ClipperOffset co;
+        ClipperLib::Paths out_this;
+        if (joinType == jtRound)
+            co.ArcTolerance = miterLimit;
+        else
+            co.MiterLimit = miterLimit;
+        co.ShortestEdgeLength = std::abs(offset * ClipperOffsetShortestEdgeFactor);
+        for (const ClipperLib::Path &path : range) {
+            co.Clear();
+            // Execute reorients the contours so that the outermost contour has a positive area.
+            // Reverse the offset and the resulting contours for a clockwise input.
+            co.AddPath(path, joinType, endType);
+            bool ccw = endType == ClipperLib::etClosedPolygon ? ClipperLib::Orientation(path) : true;
+            co.Execute(out_this, ccw ? offset : -offset);
+            if (!ccw)
+                for (ClipperLib::Path &path : out_this)
+                    std::reverse(path.begin(), path.end());
+            append(out, std::move(out_this));
+        }
+    };
     ClipperLib::Paths out;
     out.reserve(paths.size());
-    ClipperLib::Paths out_this;
-    if (joinType == jtRound)
-        co.ArcTolerance = miterLimit;
-    else
-        co.MiterLimit = miterLimit;
-    co.ShortestEdgeLength = std::abs(offset * ClipperOffsetShortestEdgeFactor);
-    for (const ClipperLib::Path &path : paths) {
-        co.Clear();
-        // Execute reorients the contours so that the outer most contour has a positive area. Thus the output
-        // contours will be CCW oriented even though the input paths are CW oriented.
-        // Offset is applied after contour reorientation, thus the signum of the offset value is reversed.
-        co.AddPath(path, joinType, endType);
-        bool ccw = endType == ClipperLib::etClosedPolygon ? ClipperLib::Orientation(path) : true;
-        co.Execute(out_this, ccw ? offset : - offset);
-        if (! ccw) {
-            // Reverse the resulting contours.
-            for (ClipperLib::Path &path : out_this)
-                std::reverse(path.begin(), path.end());
+    // Offset input contours independently and concatenate in the original
+    // order so the union sees exactly the same paths.
+    constexpr size_t max_paths_per_chunk = 16;
+    constexpr size_t target_points_per_chunk = 2048;
+    if (paths.size() >= 4 * max_paths_per_chunk) {
+        using Iterator = decltype(paths.begin());
+        struct Range {
+            Iterator first, last;
+            Iterator begin() const { return first; }
+            Iterator end() const { return last; }
+        };
+        std::vector<Range> ranges;
+        ranges.reserve((paths.size() + max_paths_per_chunk - 1) / max_paths_per_chunk);
+        auto it = paths.begin();
+        const auto end = paths.end();
+        while (it != end) {
+            const auto begin = it;
+            size_t points = 0;
+            size_t count = 0;
+            do {
+                points += (*it).size();
+                ++it;
+                ++count;
+            } while (it != end && count < max_paths_per_chunk && points < target_points_per_chunk);
+            ranges.push_back({begin, it});
         }
-        append(out, std::move(out_this));
+        std::vector<ClipperLib::Paths> chunks(ranges.size());
+        tbb::parallel_for(size_t(0), chunks.size(), [&](size_t i) {
+            offset_paths(ranges[i], chunks[i]);
+        });
+        for (auto &chunk : chunks)
+            append(out, std::move(chunk));
+        return out;
     }
+    offset_paths(paths, out);
     return out;
 }
 
