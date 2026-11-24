@@ -4,6 +4,7 @@
 #include <boost/algorithm/string/replace.hpp>
 #include <iostream>
 #include <float.h>
+#include <fast_float/fast_float.h>
 
 #if 0
     #define DEBUG
@@ -143,12 +144,14 @@ std::vector<PerExtruderAdjustments> GCodeEditor::parse_layer_gcode(  const      
     bool not_join_cooling = false;
     std::pair<int, int> node_pos;
     int line_idx = -1;
+    std::string sline;
+    std::vector<float> new_pos;
     for (; *line_start != 0; line_start = line_end)
     {
         while (*line_end != '\n' && *line_end != 0)
             ++ line_end;
         // sline will not contain the trailing '\n'.
-        std::string sline(line_start, line_end);
+        sline.assign(line_start, line_end);
         // CoolingLine will contain the trailing '\n'.
         if (*line_end == '\n')
             ++ line_end;
@@ -170,15 +173,16 @@ std::vector<PerExtruderAdjustments> GCodeEditor::parse_layer_gcode(  const      
         } else if (boost::starts_with(sline, cooling_node_label)) {
             std::string sub = sline.substr(cooling_node_label.size());
             cooling_node_id = std::stoi(sub);
-        } else if (boost::contains(sline, ";not reset fan")){
+        } else if (sline.find(";not reset fan") != std::string::npos){
             not_set_additional_fan = true;
         }
 
         if (line.type) {
             // G0, G1 or G92
             // Parse the G-code line.
-            std::vector<float> new_pos(current_pos);
+            new_pos = current_pos;
             const char *c = sline.data() + 3;
+            const char *end = sline.data() + sline.size();
             for (;;) {
                 // Skip whitespaces.
                 for (; *c == ' ' || *c == '\t'; ++ c);
@@ -191,7 +195,16 @@ std::vector<PerExtruderAdjustments> GCodeEditor::parse_layer_gcode(  const      
                               (*c == 'E') ? 3 : (*c == 'F') ? 4 :
                               (*c == 'I') ? 5 : (*c == 'J') ? 6 : size_t(-1);
                 if (axis != size_t(-1)) {
-                    new_pos[axis] = float(atof(++c));
+                    ++c;
+                    double value;
+                    const auto [next, ec] = fast_float::from_chars(c, end, value);
+                    if (ec == std::errc{} && (next == end || *next == ' ' || *next == '\t' || *next == ';')) {
+                        new_pos[axis] = float(value);
+                        c = next;
+                    } else {
+                        // Preserve the accepted formats of custom G-code.
+                        new_pos[axis] = float(atof(c));
+                    }
                     if (axis == 4) {
                         // Convert mm/min to mm/sec.
                         new_pos[4] /= 60.f;
@@ -206,14 +219,15 @@ std::vector<PerExtruderAdjustments> GCodeEditor::parse_layer_gcode(  const      
                 // Skip this word.
                 for (; *c != ' ' && *c != '\t' && *c != 0; ++ c);
             }
-            bool external_perimeter = boost::contains(sline, ";_EXTERNAL_PERIMETER");
-            bool wipe               = boost::contains(sline, ";_WIPE");
+            const size_t comment = sline.find(';');
+            const bool external_perimeter = sline.find(";_EXTERNAL_PERIMETER", comment) != std::string::npos;
+            const bool wipe = sline.find(";_WIPE", comment) != std::string::npos;
 
             record_wall_lines(append_inner_wall_ptr, line_idx, adjustment, node_pos);
 
             if (wipe)
                 line.type |= CoolingLine::TYPE_WIPE;
-            if (boost::contains(sline, ";_EXTRUDE_SET_SPEED") && !wipe && !not_join_cooling) {
+            if (sline.find(";_EXTRUDE_SET_SPEED", comment) != std::string::npos && !wipe && !not_join_cooling) {
                 line.type |= CoolingLine::TYPE_ADJUSTABLE;
                 active_speed_modifier = adjustment->lines.size();
             }
@@ -294,7 +308,7 @@ std::vector<PerExtruderAdjustments> GCodeEditor::parse_layer_gcode(  const      
                     line.type = 0;
                 }
             }
-            current_pos = std::move(new_pos);
+            current_pos.swap(new_pos);
         } else if (boost::starts_with(sline, "; Slow Down Start")) {
             not_join_cooling = true;
         } else if (boost::starts_with(sline, "; Slow Down End")) {
