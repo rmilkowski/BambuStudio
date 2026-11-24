@@ -2453,16 +2453,18 @@ void Clipper::BuildIntersectList(const cInt topY)
 {
   if ( !m_ActiveEdges ) return;
 
-  //prepare for sorting ...
+  // Project the active edges to the top of the scanbeam. They only need a
+  // sorted-edge list when two projections are out of order.
   TEdge* e = m_ActiveEdges;
-  m_SortedEdges = e;
-  while( e )
-  {
-    e->PrevInSEL = e->PrevInAEL;
-    e->NextInSEL = e->NextInAEL;
-    e->Curr.x() = TopX( *e, topY );
-    e = e->NextInAEL;
+  cInt previous_x = e->Curr.x() = TopX(*e, topY);
+  bool have_intersections = false;
+  for (e = e->NextInAEL; e; e = e->NextInAEL) {
+    const cInt x = e->Curr.x() = TopX(*e, topY);
+    have_intersections |= previous_x > x;
+    previous_x = x;
   }
+  if (!have_intersections) return;
+  CopyAELToSEL();
 
   //bubblesort ...
   bool isModified;
@@ -2579,6 +2581,7 @@ void Clipper::DoMaxima(TEdge *e)
 void Clipper::ProcessEdgesAtTopOfScanbeam(const cInt topY)
 {
   CLIPPERLIB_PROFILE_FUNC();
+  bool have_intermediate_edges = false;
   TEdge* e = m_ActiveEdges;
   while( e )
   {
@@ -2602,8 +2605,9 @@ void Clipper::ProcessEdgesAtTopOfScanbeam(const cInt topY)
     }
     else
     {
-      //2. promote horizontal edges, otherwise update Curr.x() and Curr.y() ...
-      if (IsIntermediate(e, topY) && IsHorizontal(*e->NextInLML))
+      //2. Promote horizontal edges or complete the projection from BuildIntersectList.
+      const bool is_intermediate = IsIntermediate(e, topY);
+      if (is_intermediate && IsHorizontal(*e->NextInLML))
       {
         UpdateEdgeIntoAEL(e);
         if (e->OutIdx >= 0)
@@ -2612,8 +2616,9 @@ void Clipper::ProcessEdgesAtTopOfScanbeam(const cInt topY)
       } 
       else
       {
-        e->Curr.x() = TopX( *e, topY );
+        assert(e->Curr.x() == TopX(*e, topY));
         e->Curr.y() = topY;
+        have_intermediate_edges |= is_intermediate;
       }
 
       //When StrictlySimple and 'e' is being touched by another edge, then
@@ -2643,8 +2648,8 @@ void Clipper::ProcessEdgesAtTopOfScanbeam(const cInt topY)
   ProcessHorizontals();
   m_Maxima.clear();
 
-  //4. Promote intermediate vertices ...
-  e = m_ActiveEdges;
+  //4. Promote the remaining intermediate vertices after the horizontal pass.
+  e = have_intermediate_edges ? m_ActiveEdges : nullptr;
   while(e)
   {
     if(IsIntermediate(e, topY))
